@@ -22,7 +22,7 @@ class Node2VecEmbeddings(object):
         network = pd.read_csv(network_edgelist, names=['source', 'target', 'weight'], sep = '\t')
         network = network[(network["weight"] > confidence)]
         
-        # Create int IDs for the protein label, create edge_index and edge_weigth lists (needed for node2vec)
+        # Create int IDs for the protein label and create edge_index (needed for node2vec)
         unique_labels = pd.unique(network[['source','target']].values.ravel())
         label_to_id = {label: idx for idx, label in enumerate(unique_labels)}
         network['source'] = network['source'].map(label_to_id)
@@ -87,33 +87,25 @@ class Node2VecEmbeddings(object):
 # Cluster the embeddings learned from node2vec. For now, we will cluster with Leiden, but the embeddings could
 #   be clustered with any method, hence we can expand additional clustering methods into the class.
 class ClusterEmbeddings(object):
-    def __init__(self, embeddings, seed=42):
+    def __init__(self, embeddings):
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         self.node_names = embeddings.index.tolist()
         self.embeddings = torch.from_numpy(embeddings.values).to(device=self.device)
 
-    def Leiden(self, num_neighbors=10, resolution=1.0, cosine_sim=False, seed=42):
+    def Leiden(self, num_neighbors=10, resolution=1.0, seed=42):
 
         N = len(self.embeddings)
 
-        # Create KNN graph based on cosine distance, otherwise use Euclidean distance
-        if cosine_sim:
-            row, col = knn(x=self.embeddings, y=self.embeddings, k=num_neighbors, cosine=cosine_sim)
-            cos_sim = F.cosine_similarity(self.embeddings[row], self.embeddings[col], dim=1)
-            cos_sim = torch.clamp(cos_sim, min=0.0, max=1.0)
-            row_cpu = row.detach().cpu().numpy()
-            col_cpu = col.detach().cpu().numpy()
-            sim_cpu = cos_sim.detach().cpu().numpy()
-            knn_dist_mat = coo_matrix((sim_cpu, (row_cpu, col_cpu)), shape=(N, N))
-        else:
-            row, col = knn(x=self.embeddings, y=self.embeddings, k=num_neighbors, cosine=cosine_sim)
-            distances = (self.embeddings[row] - self.embeddings[col]).norm(dim=1, p=2)
-            row_cpu = row.detach().cpu().numpy()
-            col_cpu = col.detach().cpu().numpy()
-            dist_cpu = distances.detach().cpu().numpy()
-            knn_dist_mat = coo_matrix((dist_cpu, (row_cpu, col_cpu)), shape=(N, N))
+        # Create KNN graph based on cosine similarity
+        row, col = knn(x=self.embeddings, y=self.embeddings, k=num_neighbors, cosine=True)
+        cos_sim = F.cosine_similarity(self.embeddings[row], self.embeddings[col], dim=1)
+        cos_sim = torch.clamp(cos_sim, min=0.0, max=1.0)
+        row_cpu = row.detach().cpu().numpy()
+        col_cpu = col.detach().cpu().numpy()
+        sim_cpu = cos_sim.detach().cpu().numpy()
+        knn_dist_mat = coo_matrix((sim_cpu, (row_cpu, col_cpu)), shape=(N, N))
                  
         # Convert to igraph object and run the Leiden algorithm
         graph = ig.Graph.Weighted_Adjacency(knn_dist_mat, mode="directed", loops=False)
@@ -151,7 +143,6 @@ if __name__ == "__main__":
     # Leiden Clustering Hyperparameters
     parser.add_argument('--num_neighbors', dest='num_neighbors', type=int, default=10)
     parser.add_argument('--resolution', dest='resolution', type=float, default=1.0)
-    parser.add_argument('--cosine_sim', dest='cosine_sim', action='store_true', default=False)
 
     # File for saving node2vec embeddings and cluster results 
     parser.add_argument('--embedding_out', dest='embedding_out', type=str, default="node2vec_embeddings.pkl")
@@ -179,7 +170,7 @@ if __name__ == "__main__":
     # Compute clusters from the nod2vec embeddings (here with Leiden)
     print("Clustering the Node2Vec Embeddings ...")
     ce = ClusterEmbeddings(embeddings=embeddings)
-    clusters = ce.Leiden(num_neighbors=args.num_neighbors, resolution=args.resolution, cosine_sim=args.cosine_sim)
+    clusters = ce.Leiden(num_neighbors=args.num_neighbors, resolution=args.resolution)
 
     # Save cluster results to csv
     clusters.to_csv(args.cluster_out, index = False)
