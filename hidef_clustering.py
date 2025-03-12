@@ -54,14 +54,15 @@ if __name__ == "__main__":
 
     clusters = []
     id_col = 0
+    clust_num = 1
     for comm in hidef_results.keys():
         comm_nodes = hidef_results[comm]['CD_MemberList'].split()
-        if len(comm_nodes) > args.max_size:
-            continue
-        for node in comm_nodes:
-            cluster = pd.DataFrame({"id": [id_col], "xxx": [node], "prediction": ["clust"+str(comm)]})
-            clusters.append(cluster)
-            id_col += 1
+        if len(comm_nodes) <= args.max_size:
+            for node in comm_nodes:
+                cluster = pd.DataFrame({"id": [id_col], "xxx": [node], "prediction": ["clust"+str(clust_num)]})
+                clusters.append(cluster)
+                id_col += 1
+            clust_num += 1
 
     clusters = pd.concat(clusters, ignore_index = True)
 
