@@ -14,17 +14,85 @@ from torch_geometric.nn.pool import knn
 from torch_geometric.nn import Node2Vec
 from scipy.sparse import coo_matrix
 
-# Learn the node2vec embeddings the the proteins in the PPI
+class ResolutionGraph(object):
+    def __init__(self, corr_matrix, z_score=2.0):
+
+        # Binarize the co-elution correlation matrix according to a z-score threshold
+        mean_val = np.nanmean(corr_matrix)
+        std_val = np.nanstd(corr_matrix)
+        z_matrix = (corr_matrix - mean_val) / std_val
+        binarized = (z_matrix >= z_score).astype(int)
+        graph_matrix = np.asarray(binarized)
+        np.fill_diagonal(graph_matrix, val = 0)
+        
+        adjacency = pd.DataFrame(graph_matrix, index = list(corr_matrix.index), columns = list(corr_matrix.index))
+
+        self.adjacency = adjacency
+
+    def get_adjacency(self):
+
+        return(self.adjacency)
+
+class MatrixFactEmbeddings(object):
+    def __init__(self, corr_matrix, embedding_dim, lr, max_iters):
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.N = len(corr_matrix)
+        self.P = torch.nn.Parameter(torch.randn(self.N, embedding_dim, device=self.device))
+        self.M = torch.from_numpy(np.asarray(corr_matrix.values)).to(self.device)
+        self.max_iters = max_iters
+        self.node_names = list(corr_matrix.index)
+        self.optimizer = torch.optim.Adam([self.P], lr=lr)
+        
+    def factorized_knn_graph(self, num_neighbors, embedding_out):
+
+        for it in range(self.max_iters):
+            self.optimizer.zero_grad()
+            M_approx = torch.matmul(self.P, self.P.T)
+            loss = torch.mean((self.M - M_approx) ** 2)
+            loss.backward()
+            self.optimizer.step()
+
+            if (it + 1) % 500 == 0:
+                print(f"Iteration {it+1}/{self.max_iters}, loss = {loss.item():.6f}")
+
+        # Build KNN graph
+        row, col = knn(x=self.P, y=self.P, k=num_neighbors, cosine=True)
+        cos_sim = F.cosine_similarity(self.P[row], self.P[col], dim=1)
+        cos_sim = torch.clamp(cos_sim, min=0.0, max=1.0)
+        row_cpu = row.detach().cpu().numpy()
+        col_cpu = col.detach().cpu().numpy()
+        sim_cpu = cos_sim.detach().cpu().numpy()
+        knn_dist_mat = coo_matrix((sim_cpu, (row_cpu, col_cpu)), shape=(self.N, self.N))
+        self.save_knn_to_edgelist(knn_dist_mat, self.node_names, num_neighbors)
+        graph = ig.Graph.Weighted_Adjacency(knn_dist_mat, mode="directed", loops=False)
+
+        # Save the node2vec embeddings to pickle
+        embeddings = self.P.detach().cpu().numpy()
+        with open(embedding_out, "wb") as handle:
+            pickle.dump(embeddings, handle)
+        
+        return(graph, self.node_names)
+
+    def save_knn_to_edgelist(self, coo_mat, node_names, num_neighbors):
+        
+        rows, cols, weights = coo_mat.row, coo_mat.col, coo_mat.data
+        
+        sources = np.array(node_names)[rows]
+        targets = np.array(node_names)[cols]
+        
+        edgelist_df = pd.DataFrame({'source': sources, 'target': targets,'weight': weights})
+        edgelist_df = edgelist_df[(edgelist_df["weight"] != 1.0)]
+        edgelist_df.to_csv("factorized_knn_graph_"+str(num_neighbors)+".tsv", sep = '\t', index = False)
+
 class Node2VecEmbeddings(object):
-    def __init__(self, network_edgelist, one_cluster, embedding_dim, walk_length, context_size, walks_per_node, epochs, lr, batch_size):
+    def __init__(self, adjacency, embedding_dim, walk_length, context_size, walks_per_node, epochs, lr, batch_size):
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # Load in network and filter network to only include proteins in one cluster
-        network = pd.read_csv(network_edgelist, names=['source', 'target', 'weight'], sep = '\t')
-        one_cluster = pd.read_csv(one_cluster)
-        oneclust_proteins = list(one_cluster["xxx"])
-        network = network[(network['source'].isin(oneclust_proteins) & network['target'].isin(oneclust_proteins))]
+        network = adjacency.stack().reset_index()
+        network.columns = ['source', 'target', 'weight']
+        network = network[network['weight'] != 0].reset_index(drop=True)
         
         # Create int IDs for the protein label and create edge_index (needed for node2vec)
         unique_labels = pd.unique(network[['source','target']].values.ravel())
@@ -51,7 +119,7 @@ class Node2VecEmbeddings(object):
         self.epochs = epochs
 
     # Train node2vec over range of epochs to acquire node embeddings
-    def train_node2vec(self):
+    def node2vec_knn_graph(self, num_neighbors, embedding_out):
 
         # Train node2vec model
         for epoch in range(self.epochs):
@@ -64,8 +132,25 @@ class Node2VecEmbeddings(object):
 
         # Convert embeddings to a DataFrame indexed by the node name
         embeddings = pd.DataFrame(embeddings, index=[self.id_to_label[i] for i in range(self.num_nodes)])
+        node_names = embeddings.index.tolist()
 
-        return(embeddings)
+        # Save the node2vec embeddings to pickle
+        with open(embedding_out, "wb") as handle:
+            pickle.dump(embeddings, handle)
+
+        # Create KNN graph based on cosine similarity
+        N = len(embeddings)
+        embeddings = torch.from_numpy(embeddings.values).to(device=self.device)
+        row, col = knn(x=embeddings, y=embeddings, k=num_neighbors, cosine=True)
+        cos_sim = F.cosine_similarity(embeddings[row], embeddings[col], dim=1)
+        cos_sim = torch.clamp(cos_sim, min=0.0, max=1.0)
+        row_cpu = row.detach().cpu().numpy()
+        col_cpu = col.detach().cpu().numpy()
+        sim_cpu = cos_sim.detach().cpu().numpy()
+        knn_dist_mat = coo_matrix((sim_cpu, (row_cpu, col_cpu)), shape=(N, N))
+        graph = ig.Graph.Weighted_Adjacency(knn_dist_mat, mode="directed", loops=False)
+
+        return(graph, node_names)
 
     # Training function
     def train(self):
@@ -87,37 +172,21 @@ class Node2VecEmbeddings(object):
     
         return(total_loss / len(loader))
 
-# Cluster the embeddings learned from node2vec. For now, we will cluster with Leiden, but the embeddings could
-#   be clustered with any method, hence we can expand additional clustering methods into the class.
-class ClusterEmbeddings(object):
-    def __init__(self, embeddings):
+class ClusterGraph(object):
+    def __init__(self, graph, node_names, weighted=False):
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        self.node_names = embeddings.index.tolist()
-        self.embeddings = torch.from_numpy(embeddings.values).to(device=self.device)
+        self.graph = graph
+        self.node_names = node_names
+        self.weighted = "weight" if weighted else None
 
-    def MultiResLeiden(self, num_neighbors=10, resolution_min=0.001, resolution_max=25, tau=0.75, chi=2, p=0.75, seed=42):
-
-        # Create KNN graph based on cosine similarity
-        N = len(self.embeddings)
-        print("Total proteins in network:", N)
-        row, col = knn(x=self.embeddings, y=self.embeddings, k=num_neighbors, cosine=True)
-        cos_sim = F.cosine_similarity(self.embeddings[row], self.embeddings[col], dim=1)
-        cos_sim = torch.clamp(cos_sim, min=0.0, max=1.0)
-        row_cpu = row.detach().cpu().numpy()
-        col_cpu = col.detach().cpu().numpy()
-        sim_cpu = cos_sim.detach().cpu().numpy()
-        knn_dist_mat = coo_matrix((sim_cpu, (row_cpu, col_cpu)), shape=(N, N))
-        self.save_knn_to_edgelist(knn_dist_mat, self.node_names, num_neighbors)
-                 
-        # Convert to igraph object and run the Leiden algorithm for increasing gamma resolution
+    def MultiResLeiden(self, resolution_min=0.001, resolution_max=25, tau=0.75, chi=2, p=0.75, seed=42):
+    
+        # Run the Leiden algorithm for increasing gamma resolution
         partitions = {}
-        graph = ig.Graph.Weighted_Adjacency(knn_dist_mat, mode="directed", loops=False)
         gamma_values = self.sample_gamma_values(gamma_min=resolution_min, gamma_max=resolution_max)
         print("Running Leiden for", len(gamma_values), "resolutions")
         for resolution in gamma_values:
-            partition = la.find_partition(graph, la.RBConfigurationVertexPartition, weights="weight",
+            partition = la.find_partition(self.graph, la.RBConfigurationVertexPartition, weights=self.weighted,
                                           resolution_parameter=resolution, seed=seed)
 
             cluster_dict = defaultdict(set)
@@ -243,37 +312,38 @@ class ClusterEmbeddings(object):
         
         return(inter / union if union > 0 else 0.0)
 
-    def save_knn_to_edgelist(self, coo_mat, node_names, num_neighbors):
-        
-        rows, cols, weights = coo_mat.row, coo_mat.col, coo_mat.data
-        
-        sources = np.array(node_names)[rows]
-        targets = np.array(node_names)[cols]
-        
-        edgelist_df = pd.DataFrame({'source': sources, 'target': targets,'weight': weights})
-        edgelist_df = edgelist_df[(edgelist_df["weight"] != 1.0)]
-        edgelist_df.to_csv("node2vec_knn_graph_"+str(num_neighbors)+".tsv", sep = '\t', index = False)
-
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
 
-    # Network edgelist from Kaggle and confidence filter
-    parser.add_argument('--network_edgelist', dest='network_edgelist', type=str, default='data/interaction/network_with_weights.edgelist')
-    parser.add_argument('--one_cluster', dest='one_cluster', type=str, default='protein_onecluster.csv')
+    # Co-elution data from Kaggle OR the pre-computed correlation matrix
+    parser.add_argument('--coelution_data', dest='coelution_data', type=str, default='data/coelution/repl1_repl2_combined.tsv')
+    parser.add_argument('--corr_matrix', dest='corr_matrix', type=str, default='data/coelution/correlation_matrix.pkl')
+    parser.add_argument('--one_cluster', dest='one_cluster', type=str, default='coelution_onecluster.csv')
+    parser.add_argument('--correlate', action='store_true', default=False)
+    parser.add_argument('--z_score', dest='z_score', type=float, default=2.0)
 
-    # Node2Vec Hyperparameters
-    parser.add_argument('--embedding_dim', dest='embedding_dim', type=int, default=128)
+    # Matrix Factorization Specific Hyperparameters
+    parser.add_argument('--factorize', action='store_true', default=False)
+    parser.add_argument('--max_iters', dest='max_iters', type=int, default=5000)
+
+    # Node2Vec Specific Hyperparameters
+    parser.add_argument('--node2vec', action='store_true', default=False)
     parser.add_argument('--walk_length', dest='walk_length', type=int, default=80)
     parser.add_argument('--context_size', dest='context_size', type=int, default=10)
     parser.add_argument('--walks_per_node', dest='walks_per_node', type=int, default=5)
-    parser.add_argument('--epochs', dest='epochs', type=int, default=100)
-    parser.add_argument('--lr', dest='lr', type=float, default=0.01)
     parser.add_argument('--batch_size', dest='batch_size', type=int, default=128)
+    parser.add_argument('--epochs', dest='epochs', type=int, default=50)
+
+    # Hyperparameters used by Matrix Factorization and Node2Vec
+    parser.add_argument('--embedding_dim', dest='embedding_dim', type=int, default=128)
+    parser.add_argument('--lr', dest='lr', type=float, default=0.01)
     parser.add_argument('--use_embeddings', action='store_true', default=False)
 
-    # Leiden Clustering Hyperparameters
+    # KNN Graph Hyperparameter
     parser.add_argument('--num_neighbors', dest='num_neighbors', type=int, default=10)
+
+    # Leiden Clustering Hyperparameters
     parser.add_argument('--resolution_min', dest='resolution_min', type=float, default=0.001)
     parser.add_argument('--resolution_max', dest='resolution_max', type=float, default=25)
     parser.add_argument('--tau', dest='tau', type=float, default=0.75)
@@ -281,44 +351,84 @@ if __name__ == "__main__":
     parser.add_argument('--p', dest='p', type=float, default=0.75)
 
     # File for saving node2vec embeddings and cluster results 
-    parser.add_argument('--embedding_out', dest='embedding_out', type=str, default="node2vec_embeddings.pkl")
-    parser.add_argument('--cluster_out', dest='cluster_out', type=str, default="protein_clusters.csv")
+    parser.add_argument('--embedding_out', dest='embedding_out', type=str, default="coelution_embeddings.pkl")
+    parser.add_argument('--cluster_out', dest='cluster_out', type=str, default="coelution_clusters.csv")
+    
     args = parser.parse_args()
 
-    # Compute node2vec embeddings
-    if args.use_embeddings:
-        print("Using saved embeddings ...")
-        with open("node2vec_embeddings.pkl", "rb") as handle:
-            embeddings = pickle.load(handle)
+    # Only correlate co-elution if not already
+    if args.correlate:
+        coelution = pd.read_csv(args.coelution_data, sep = '\t', index_col = 0)
+        onecluster = pd.read_csv(args.one_cluster)
+        oneclust_proteins = list(onecluster["xxx"])
+        coelution = coelution[(coelution.index.isin(oneclust_proteins))]
+        coelution = coelution.transpose()
+        print("Correlating the coelution data ...")
+        corr_matrix = coelution.corr(min_periods=3)
+        corr_matrix = corr_matrix.fillna(0)
+        with open("data/coelution/correlation_matrix.pkl", "wb") as handle:
+            pickle.dump(corr_matrix, handle)
     else:
-        print("Learning Node2Vec Embeddings ...")
-        embeddings = Node2VecEmbeddings(network_edgelist=args.network_edgelist,
-                                        one_cluster=args.one_cluster,
-                                        embedding_dim=args.embedding_dim,
-                                        walk_length=args.walk_length,
-                                        context_size=args.context_size,
-                                        walks_per_node=args.walks_per_node,
-                                        epochs=args.epochs,
-                                        lr=args.lr,
-                                        batch_size=args.batch_size).train_node2vec()
+        with open(args.corr_matrix, "rb") as handle:
+            corr_matrix = pickle.load(handle)
 
-        # Save the node2vec embeddings to pickle
-        with open(args.embedding_out, "wb") as handle:
-            pickle.dump(embeddings, handle)
-        
-        print('\n')
+    if args.use_embeddings:
+        print("Using trained embeddings ...")
+        with open("coelution_embeddings.pkl", "rb") as handle:
+            embeddings = pickle.load(handle)
+        node_names = corr_matrix.index.tolist()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        N = len(embeddings)
+        embeddings = torch.from_numpy(embeddings).to(device=device)
+        row, col = knn(x=embeddings, y=embeddings, k=args.num_neighbors, cosine=True)
+        cos_sim = F.cosine_similarity(embeddings[row], embeddings[col], dim=1)
+        cos_sim = torch.clamp(cos_sim, min=0.0, max=1.0)
+        row_cpu = row.detach().cpu().numpy()
+        col_cpu = col.detach().cpu().numpy()
+        sim_cpu = cos_sim.detach().cpu().numpy()
+        knn_dist_mat = coo_matrix((sim_cpu, (row_cpu, col_cpu)), shape=(N, N))
+        graph = ig.Graph.Weighted_Adjacency(knn_dist_mat, mode="directed", loops=False)
+        weighted = True
+    elif args.factorize:
+        print("Learning Factorization Embeddings and building KNN graph ...")
+        mf = MatrixFactEmbeddings(corr_matrix=corr_matrix,
+                                  embedding_dim=args.embedding_dim,
+                                  lr=args.lr,
+                                  max_iters=args.max_iters)
+        graph, node_names = mf.factorized_knn_graph(args.num_neighbors, args.embedding_out)
+        weighted = True       
+    elif args.node2vec:
+        print("Learning Node2Vec Embeddings and building KNN graph ...")
+        adjacency = ResolutionGraph(corr_matrix=corr_matrix, z_score=args.z_score).get_adjacency()
+        n2v = Node2VecEmbeddings(adjacency=adjacency,
+                                 embedding_dim=args.embedding_dim,
+                                 walk_length=args.walk_length,
+                                 context_size=args.context_size,
+                                 walks_per_node=args.walks_per_node,
+                                 epochs=args.epochs,
+                                 lr=args.lr,
+                                 batch_size=args.batch_size)
+        graph, node_names = n2v.node2vec_knn_graph(args.num_neighbors, args.embedding_out)
+        weighted = True
+    else:
+        adjacency = ResolutionGraph(corr_matrix=corr_matrix, z_score=args.z_score).get_adjacency()
+        node_names = list(adjacency.index)
+        graph = ig.Graph.Adjacency(adjacency, mode="undirected", loops=False)
+        weighted = False
+    
+    print('\n')
 
     # Compute clusters from the nod2vec embeddings (here with Leiden)
-    print("Clustering the Node2Vec Embeddings ...")
-    ce = ClusterEmbeddings(embeddings=embeddings)
-    clusters = ce.MultiResLeiden(num_neighbors=args.num_neighbors, resolution_min=args.resolution_min,
-                                 resolution_max=args.resolution_max, tau=args.tau, chi=args.chi, p=args.p)
+    print("Clustering the Established graph ...")
+    ce = ClusterGraph(graph=graph, node_names=node_names, weighted=weighted)
+    clusters = ce.MultiResLeiden(resolution_min=args.resolution_min, 
+                                 resolution_max=args.resolution_max, 
+                                 tau=args.tau, 
+                                 chi=args.chi, 
+                                 p=args.p)
 
     print("Number of clusters:", len(list(set(list(clusters["prediction"])))))
     print("Total number of nodes:", len(list(set(list(clusters["xxx"])))))
 
     # Save cluster results to csv
     clusters.to_csv(args.cluster_out, index = False)
-
-    
-        
